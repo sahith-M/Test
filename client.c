@@ -1,196 +1,263 @@
+// C libraries needed
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
 #include <pthread.h>
 #include <semaphore.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
 #include <math.h>
 
-// Buffer and file size constraints
-#define MAX_BUFFER_SIZE 100076
-#define CHUNK_SIZE 64
-#define ENCODE_PORT 14357
-#define SERVER_IP "127.0.0.1"
-#define SERVER_PORT 11122
-#define INPUT_FILENAME "input.txt"
-#define OUTPUT_FILENAME "receivedVowelCount.txt"
-#define FRAME_SIZE 536
+// Defining constants for file and network configurations
+#define BUFFER_LIMIT 100076
+#define DATA_SEGMENT_SIZE 64
+#define ENCODE_SERVER_PORT 14357
+#define MAIN_SERVER_PORT 11122
+#define LOCALHOST_IP "127.0.0.1"
+#define INPUT_FILE "input.txt"
+#define OUTPUT_FILE "result.txt"
+#define PACKET_SIZE 536
 
-// Structure to hold encoding/decoding data
-typedef struct {
-    char chunkData[CHUNK_SIZE];
-    char frameData[FRAME_SIZE];
-} DataFrames;
+typedef struct
+{
+    char segmentData[DATA_SEGMENT_SIZE]; // Holds individual data segments
+    char encodedFrame[PACKET_SIZE];      // Stores the encoded data frame
+} TransmissionPacket;
 
-
-
-// Function to send data for encoding
-void send_for_encoding(char *chunk, char *encodedData) {
-    int socketHandle = socket(AF_INET, SOCK_STREAM, 0);
-    if (socketHandle < 0) {
-        perror("Socket creation failed");
-        exit(1);
-    }
-
-    struct sockaddr_in helperAddress;
-    helperAddress.sin_family = AF_INET;
-    helperAddress.sin_port = htons(ENCODE_PORT);
-    helperAddress.sin_addr.s_addr = inet_addr(SERVER_IP);
-
-    if (connect(socketHandle, (struct sockaddr *)&helperAddress, sizeof(helperAddress)) < 0) {
-        perror("Connection to encoder failed");
-        exit(1);
-    }
-
-    printf("Sending data for encoding to %s:%d...\n", SERVER_IP, ENCODE_PORT);
-    send(socketHandle, "E", 1, 0);
-    send(socketHandle, chunk, CHUNK_SIZE, 0);
-
-    int receivedBytes = recv(socketHandle, encodedData, FRAME_SIZE - 1, 0);
-    if (receivedBytes < 0) {
-        perror("Error receiving encoded data");
-    } else {
-        encodedData[receivedBytes] = '\0';
-        printf("Encoding completed. Encoded data received.\n");
-    }
-    close(socketHandle);
-}
-
-// Function to request decoding of data
-void request_decoding(char *encodedPacket, char *decodedChunk) {
-    int socketHandle = socket(AF_INET, SOCK_STREAM, 0);
-    if (socketHandle < 0) {
-        perror("Socket creation failed");
-        exit(1);
-    }
-
-    struct sockaddr_in helperAddress;
-    helperAddress.sin_family = AF_INET;
-    helperAddress.sin_port = htons(ENCODE_PORT);
-    helperAddress.sin_addr.s_addr = inet_addr(SERVER_IP);
-
-    if (connect(socketHandle, (struct sockaddr *)&helperAddress, sizeof(helperAddress)) < 0) {
-        perror("Connection to decoder failed");
-        exit(1);
-    }
-
-    send(socketHandle, "D", 1, 0);
-    send(socketHandle, encodedPacket, FRAME_SIZE, 0);
-
-    recv(socketHandle, decodedChunk, CHUNK_SIZE, 0);
-    close(socketHandle);
-}
-
-// Function to write content to a file
-void write_to_output(const char *filename, const char *data) {
-    FILE *fileHandle = fopen(filename, "w");
-    if (!fileHandle) {
-        perror("Failed to open output file");
+void transmit_for_encoding(const char *dataSegment, char *processedData)
+{
+    // Create a TCP socket
+    int socketFD = socket(AF_INET, SOCK_STREAM, 0);
+    if (socketFD < 0)
+    {
+        perror("Failed to create socket");
         exit(EXIT_FAILURE);
     }
 
-    fprintf(fileHandle, "%s", data);
-    fclose(fileHandle);
-    printf("Results saved to %s.\n", filename);
+    // Define the encoding server's address
+    struct sockaddr_in encoderAddr;
+    encoderAddr.sin_family = AF_INET;
+    encoderAddr.sin_port = htons(ENCODE_SERVER_PORT);
+    encoderAddr.sin_addr.s_addr = inet_addr(LOCALHOST_IP);
+
+    // Establish a connection to the encoding server
+    if (connect(socketFD, (struct sockaddr *)&encoderAddr, sizeof(encoderAddr)) < 0)
+    {
+        perror("Connection to encoding server failed");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Transmitting data for encoding to %s:%d...\n", LOCALHOST_IP, ENCODE_SERVER_PORT);
+
+    // Send encoding request and data segment
+    send(socketFD, "E", 1, 0);
+    send(socketFD, dataSegment, DATA_SEGMENT_SIZE, 0);
+
+    // Receive the encoded result
+    int bytesReceived = recv(socketFD, processedData, PACKET_SIZE - 1, 0);
+    if (bytesReceived < 0)
+    {
+        perror("Failed to receive encoded data");
+    }
+    else
+    {
+        processedData[bytesReceived] = '\0'; // Null-terminate the received string
+        printf("Data encoding successful. Received encoded data.\n");
+    }
+
+    // Close the socket
+    close(socketFD);
 }
 
-// Function to load input file data into a buffer
-void load_input_data(char *dataBuffer, size_t bufferSize) {
-    FILE *fileHandle = fopen(INPUT_FILENAME, "r");
-    if (fileHandle == NULL) {
-        perror("Failed to open input file");
-        exit(1);
-    }
-    memset(dataBuffer, 0, bufferSize);
-    size_t bytesRead = fread(dataBuffer, 1, bufferSize - 1, fileHandle);
-    
-    if (ferror(fileHandle)) {
-        perror("Error reading file");
-        fclose(fileHandle);
-        exit(1);
+void initiate_decoding(const char *encodedFrame, char *decodedSegment)
+{
+    // Create a TCP socket
+    int socketFD = socket(AF_INET, SOCK_STREAM, 0);
+    if (socketFD < 0)
+    {
+        perror("Failed to create socket");
+        exit(EXIT_FAILURE);
     }
 
-    dataBuffer[bytesRead] = '\0';
-    fclose(fileHandle);
-    printf("Successfully loaded input data from %s.\n", INPUT_FILENAME);
+    // Define the decoding server's address
+    struct sockaddr_in decoderAddr;
+    decoderAddr.sin_family = AF_INET;
+    decoderAddr.sin_port = htons(ENCODE_SERVER_PORT);
+    decoderAddr.sin_addr.s_addr = inet_addr(LOCALHOST_IP);
+
+    // Establish a connection to the decoding server
+    if (connect(socketFD, (struct sockaddr *)&decoderAddr, sizeof(decoderAddr)) < 0)
+    {
+        perror("Connection to decoding server failed");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Requesting data decoding from %s:%d...\n", LOCALHOST_IP, ENCODE_SERVER_PORT);
+
+    // Send decoding request and encoded data frame
+    send(socketFD, "D", 1, 0);
+    send(socketFD, encodedFrame, PACKET_SIZE, 0);
+
+    // Receive decoded result
+    int bytesReceived = recv(socketFD, decodedSegment, DATA_SEGMENT_SIZE, 0);
+    if (bytesReceived < 0)
+    {
+        perror("Failed to receive decoded data");
+    }
+    else
+    {
+        decodedSegment[bytesReceived] = '\0'; // Null-terminate the decoded segment
+        printf("Decoding completed successfully.\n");
+    }
+
+    // Close the socket
+    close(socketFD);
 }
 
-int main() {
-    char fileContent[MAX_BUFFER_SIZE];
-    char serverReply[MAX_BUFFER_SIZE];
-    
-    load_input_data(fileContent, MAX_BUFFER_SIZE);
-    
-    int segmentTotal = (strlen(fileContent) + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    printf("Splitting data into %d segments for encoding...\n", segmentTotal);
-
-    char encodingBuffer[segmentTotal * FRAME_SIZE];
-
-    for (int i = 0; i < segmentTotal; i++) {
-        char tempSegment[CHUNK_SIZE];
-        strncpy(tempSegment, fileContent + (i * CHUNK_SIZE), CHUNK_SIZE);
-        char encodedSegment[FRAME_SIZE];
-        send_for_encoding(tempSegment, encodedSegment);
-        memcpy(&encodingBuffer[i * FRAME_SIZE], encodedSegment, FRAME_SIZE);
+void save_results_to_file(const char *outputFile, const char *content)
+{
+    // Open the file in write mode
+    FILE *outputStream = fopen(outputFile, "w");
+    if (!outputStream)
+    {
+        perror("Error opening output file");
+        exit(EXIT_FAILURE);
     }
 
-    int socketMain = socket(AF_INET, SOCK_STREAM, 0);
-    if (socketMain < 0) {
+    // Write the content to the file
+    fprintf(outputStream, "%s", content);
+    fclose(outputStream);
+
+    printf("Data successfully saved to %s.\n", outputFile);
+}
+
+void read_input_file(char *buffer, size_t bufferCapacity)
+{
+    // Open the input file for reading
+    FILE *inputStream = fopen(INPUT_FILE, "r");
+    if (inputStream == NULL)
+    {
+        perror("Error opening input file");
+        exit(EXIT_FAILURE);
+    }
+
+    // Clear the buffer before reading data
+    memset(buffer, 0, bufferCapacity);
+
+    // Read data from the file into the buffer
+    size_t bytesRead = fread(buffer, sizeof(char), bufferCapacity - 1, inputStream);
+
+    // Check if file reading encountered an error
+    if (ferror(inputStream))
+    {
+        perror("File read error");
+        fclose(inputStream);
+        exit(EXIT_FAILURE);
+    }
+
+    // Null-terminate the buffer to prevent overflow
+    buffer[bytesRead] = '\0';
+    fclose(inputStream);
+
+    printf("Input data successfully loaded from %s.\n", INPUT_FILE);
+}
+
+int main()
+{
+    char inputData[BUFFER_LIMIT];      // Buffer to store input file content
+    char serverResponse[BUFFER_LIMIT]; // Buffer to store server's reply
+
+    read_input_file(inputData, BUFFER_LIMIT);
+
+    int totalSegments = (strlen(inputData) + DATA_SEGMENT_SIZE - 1) / DATA_SEGMENT_SIZE;
+    printf("Preparing %d segments for encoding...\n", totalSegments);
+
+    char encodedDataBuffer[totalSegments * PACKET_SIZE];
+
+    for (int i = 0; i < totalSegments; i++)
+    {
+        char currentSegment[DATA_SEGMENT_SIZE];
+        strncpy(currentSegment, inputData + (i * DATA_SEGMENT_SIZE), DATA_SEGMENT_SIZE);
+
+        char encodedSegment[PACKET_SIZE];
+        transmit_for_encoding(currentSegment, encodedSegment);
+        memcpy(&encodedDataBuffer[i * PACKET_SIZE], encodedSegment, PACKET_SIZE);
+    }
+
+    // Create a socket to connect to the main server
+    int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (clientSocket < 0)
+    {
         perror("Socket creation failed");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
-    struct sockaddr_in serverAddress;
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(SERVER_PORT);
-    serverAddress.sin_addr.s_addr = inet_addr(SERVER_IP);
+    // Define the server's address and port
+    struct sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(MAIN_SERVER_PORT);
+    serverAddr.sin_addr.s_addr = inet_addr(LOCALHOST_IP);
 
-    if (connect(socketMain, (struct sockaddr *)&serverAddress, sizeof(serverAddress)) < 0) {
+    // Connect to the server
+    if (connect(clientSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0)
+    {
         perror("Connection to server failed");
-        exit(1);
-    }
-
-    printf("Sending encoded data to server on port %d...\n", SERVER_PORT);
-    send(socketMain, encodingBuffer, sizeof(encodingBuffer), 0);
-
-    int receivedData = read(socketMain, serverReply, MAX_BUFFER_SIZE);
-    if (receivedData > 0) {
-        serverReply[receivedData] = '\0';
-        printf("Server response received.\n");
-    } else {
-        perror("No server response");
-        close(socketMain);
         exit(EXIT_FAILURE);
     }
 
-    char decodedResponse[(receivedData - 1) / 8 - ((receivedData - 1) / FRAME_SIZE) * 3 + 1];
-    decodedResponse[0] = '\0';
+    printf("Transmitting encoded data to server on port %d...\n", MAIN_SERVER_PORT);
+    send(clientSocket, encodedDataBuffer, sizeof(encodedDataBuffer), 0);
 
-    int decodeSegmentCount = (receivedData - 1 + FRAME_SIZE - 1) / FRAME_SIZE;
-    printf("Decoding %d segments received from the server...\n", decodeSegmentCount);
+    // Receive the server's response
+    int bytesRead = read(clientSocket, serverResponse, BUFFER_LIMIT);
+    if (bytesRead > 0)
+    {
+        serverResponse[bytesRead] = '\0';
+        printf("Received server response.\n");
+    }
+    else
+    {
+        perror("No response from server");
+        close(clientSocket);
+        exit(EXIT_FAILURE);
+    }
 
-    int totalCharCount = 0;
-    for (int i = 0; i < decodeSegmentCount; i++) {
-        char tempDecodedChunk[CHUNK_SIZE];
-        request_decoding(&serverReply[i * FRAME_SIZE], tempDecodedChunk);
+    int decodedSize = (bytesRead - 1) / 8 - ((bytesRead - 1) / PACKET_SIZE) * 3 + 1;
+    char decodedOutput[decodedSize];
+    decodedOutput[0] = '\0';
 
-        if (i == decodeSegmentCount - 1) {
-            totalCharCount += (receivedData - (i * FRAME_SIZE) - 24) / 8;
-            memcpy(&decodedResponse[i * CHUNK_SIZE], tempDecodedChunk, (receivedData - 1 - (i * FRAME_SIZE) - 24) / 8);
-        } else {
-            totalCharCount += CHUNK_SIZE;
-            memcpy(&decodedResponse[i * CHUNK_SIZE], tempDecodedChunk, CHUNK_SIZE);
+    int segmentsToDecode = (bytesRead - 1 + PACKET_SIZE - 1) / PACKET_SIZE;
+    printf("Decoding %d segments from server response...\n", segmentsToDecode);
+
+    int decodedCharCount = 0;
+
+    // Decode each segment and accumulate the result
+    for (int i = 0; i < segmentsToDecode; i++)
+    {
+        char decodedSegment[DATA_SEGMENT_SIZE];
+        initiate_decoding(&serverResponse[i * PACKET_SIZE], decodedSegment);
+
+        if (i == segmentsToDecode - 1)
+        {
+            int remainingBytes = (bytesRead - 1 - (i * PACKET_SIZE) - 24) / 8;
+            decodedCharCount += remainingBytes;
+            memcpy(&decodedOutput[i * DATA_SEGMENT_SIZE], decodedSegment, remainingBytes);
+        }
+        else
+        {
+            decodedCharCount += DATA_SEGMENT_SIZE;
+            memcpy(&decodedOutput[i * DATA_SEGMENT_SIZE], decodedSegment, DATA_SEGMENT_SIZE);
         }
     }
 
-    decodedResponse[totalCharCount] = '\0';
-    printf("Decoding complete. Final response:\n%s\n", decodedResponse);
+    decodedOutput[decodedCharCount] = '\0';
+    printf("Decoding completed. Final output:\n%s\n", decodedOutput);
 
-    write_to_output(OUTPUT_FILENAME, decodedResponse);
-    close(socketMain);
+    // Save decoded results to the output file
+    save_results_to_file(OUTPUT_FILE, decodedOutput);
+    close(clientSocket);
 
     return 0;
 }

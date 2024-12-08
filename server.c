@@ -1,453 +1,726 @@
 #include <stdio.h>
-#include <pthread.h>
-#include <semaphore.h>
-#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <fcntl.h>
 
-#define PORT 11122
-#define BUF_SIZE 100076
-#define ENCODED_SIZE 536
-#define CHAR_SIZE 64
-#define MAX_QUEUE_SIZE 6
+// Server Configuration
+#define SERVER_PORT 11122
+#define BUFFER_CAPACITY 100076
+#define FRAME_SIZE 536
+#define SEGMENT_SIZE 64
+#define MAX_QUEUE_LENGTH 6
 
-#define A_IDX 0
-#define E_IDX 1
-#define I_IDX 2
-#define O_IDX 3
-#define U_IDX 4
+// Vowel Indices
+#define VOWEL_A 0
+#define VOWEL_E 1
+#define VOWEL_I 2
+#define VOWEL_O 3
+#define VOWEL_U 4
 
-// Global array to track vowel counts: [A, E, I, O, U]
-int vowel_stats[5] = {0};
+// Global Vowel Count Tracker: [A, E, I, O, U]
+int vowelCount[5] = {0};
 
-typedef struct {
-    char *messages[MAX_QUEUE_SIZE];
-    int head, tail;
-    pthread_mutex_t lock;
-    pthread_cond_t not_empty, not_full;
-} Queue;
+// Structure for Message Queue
+typedef struct
+{
+    char *queueMessages[MAX_QUEUE_LENGTH]; // Message storage
+    int front, rear;                       // Queue pointers
+    pthread_mutex_t queueLock;             // Lock for thread-safe access
+    pthread_cond_t notEmpty, notFull;      // Conditions for empty/full queues
+} MessageQueue;
 
-Queue queues[5];
-sem_t semaphores[6];
+// Declare separate queues for each vowel
+MessageQueue vowelQueues[5];
 
-void initializeQueue(Queue *queue) {
-    queue->head = queue->tail = 0;
-    pthread_mutex_init(&queue->lock, NULL);
-    pthread_cond_init(&queue->not_empty, NULL);
-    pthread_cond_init(&queue->not_full, NULL);
+// Declare semaphores for synchronization
+sem_t taskSemaphores[6];
+
+// Initializes a message queue by resetting pointers and initializing locks/conditions
+void initialize_message_queue(MessageQueue *queue)
+{
+    queue->front = queue->rear = 0;
+    pthread_mutex_init(&queue->queueLock, NULL);
+    pthread_cond_init(&queue->notEmpty, NULL);
+    pthread_cond_init(&queue->notFull, NULL);
 }
 
-void pushQueue(Queue *queue, const char *message) {
-    pthread_mutex_lock(&queue->lock);
-    while ((queue->tail + 1) % MAX_QUEUE_SIZE == queue->head) {
-        pthread_cond_wait(&queue->not_full, &queue->lock);
+// Adds a message to the queue (blocking if full)
+void enqueue_message(MessageQueue *queue, const char *message)
+{
+    // Lock the queue for safe access
+    pthread_mutex_lock(&queue->queueLock);
+
+    // Wait if the queue is full
+    while ((queue->rear + 1) % MAX_QUEUE_LENGTH == queue->front)
+    {
+        pthread_cond_wait(&queue->notFull, &queue->queueLock);
     }
-    queue->messages[queue->tail] = strdup(message);
-    queue->tail = (queue->tail + 1) % MAX_QUEUE_SIZE;
-    pthread_cond_signal(&queue->not_empty);
-    pthread_mutex_unlock(&queue->lock);
+
+    // Add the message to the queue
+    queue->queueMessages[queue->rear] = strdup(message);
+    queue->rear = (queue->rear + 1) % MAX_QUEUE_LENGTH;
+
+    // Signal that the queue is no longer empty
+    pthread_cond_signal(&queue->notEmpty);
+
+    // Unlock the queue after insertion
+    pthread_mutex_unlock(&queue->queueLock);
 }
 
-char *popQueue(Queue *queue) {
-    pthread_mutex_lock(&queue->lock);
-    while (queue->head == queue->tail) {
-        pthread_cond_wait(&queue->not_empty, &queue->lock);
+// Removes and returns a message from the queue (blocking if empty)
+char *dequeue_message(MessageQueue *queue)
+{
+    // Lock the queue for safe access
+    pthread_mutex_lock(&queue->queueLock);
+
+    // Wait if the queue is empty
+    while (queue->front == queue->rear)
+    {
+        pthread_cond_wait(&queue->notEmpty, &queue->queueLock);
     }
-    char *message = queue->messages[queue->head];
-    queue->head = (queue->head + 1) % MAX_QUEUE_SIZE;
-    pthread_cond_signal(&queue->not_full);
-    pthread_mutex_unlock(&queue->lock);
+
+    // Remove the message from the front of the queue
+    char *message = queue->queueMessages[queue->front];
+    queue->front = (queue->front + 1) % MAX_QUEUE_LENGTH;
+
+    // Signal that the queue is no longer full
+    pthread_cond_signal(&queue->notFull);
+
+    // Unlock the queue after removal
+    pthread_mutex_unlock(&queue->queueLock);
+
     return message;
 }
 
-void *charA(void *arg) {
-    sem_wait(&semaphores[0]);
+// Processes 'A' characters from the corresponding queue
+void *process_char_A(void *arg)
+{
+    // Wait for the semaphore signal
+    sem_wait(&taskSemaphores[VOWEL_A]);
     printf("Thread A: Processing 'A' characters\n");
-    char *message = popQueue(&queues[0]);
-    char *queueMsgDuplicate = malloc(ENCODED_SIZE * sizeof(char));  // Dynamically allocate memory
-    int index = 0;
 
-    for (int i = 0; message[i] != '\0'; i++) {
-        if (index >= ENCODED_SIZE) {  // If space is not enough, realloc to double the size
-            queueMsgDuplicate = realloc(queueMsgDuplicate, (index + ENCODED_SIZE) * sizeof(char));
+    // Retrieve a message from the 'A' queue
+    char *message = dequeue_message(&vowelQueues[VOWEL_A]);
+    if (!message)
+        return NULL;
+
+    // Allocate dynamic memory for processed output
+    char *processedMessage = malloc(FRAME_SIZE * sizeof(char));
+    int outputIndex = 0;
+
+    // Process each character in the message
+    for (int i = 0; message[i] != '\0'; i++)
+    {
+        // Reallocate memory if the buffer runs out of space
+        if (outputIndex >= FRAME_SIZE)
+        {
+            processedMessage = realloc(processedMessage, (outputIndex + FRAME_SIZE) * sizeof(char));
         }
-        queueMsgDuplicate[index++] = message[i];
-        if (message[i] == 'a' || message[i] == 'A') {
-            vowel_stats[A_IDX]++;
-            char count_str[10];
-            snprintf(count_str, sizeof(count_str), "%d", vowel_stats[A_IDX]);
-            for (int j = 0; count_str[j] != '\0'; j++) {
-                if (index >= ENCODED_SIZE) {
-                    queueMsgDuplicate = realloc(queueMsgDuplicate, (index + ENCODED_SIZE) * sizeof(char));
+
+        // Copy the current character to the processed buffer
+        processedMessage[outputIndex++] = message[i];
+
+        // Update vowel count and append it if 'A' or 'a' is found
+        if (message[i] == 'a' || message[i] == 'A')
+        {
+            vowelCount[VOWEL_A]++;
+            char countStr[10];
+            snprintf(countStr, sizeof(countStr), "%d", vowelCount[VOWEL_A]);
+
+            // Append the updated count to the processed buffer
+            for (int j = 0; countStr[j] != '\0'; j++)
+            {
+                if (outputIndex >= FRAME_SIZE)
+                {
+                    processedMessage = realloc(processedMessage, (outputIndex + FRAME_SIZE) * sizeof(char));
                 }
-                queueMsgDuplicate[index++] = count_str[j];
+                processedMessage[outputIndex++] = countStr[j];
             }
         }
     }
+
+    // Null-terminate the processed message and free original memory
+    processedMessage[outputIndex] = '\0';
     free(message);
-    queueMsgDuplicate[index] = '\0';
-    pushQueue(&queues[1], queueMsgDuplicate);
-    sem_post(&semaphores[1]);
+
+    // Enqueue the processed message into the next queue and signal the next semaphore
+    enqueue_message(&vowelQueues[VOWEL_E], processedMessage);
+    sem_post(&taskSemaphores[VOWEL_E]);
+
+    return NULL;
 }
 
-void *charE(void *arg) {
-    sem_wait(&semaphores[1]);
+void *process_char_E(void *arg)
+{
+    // Wait for the semaphore signal
+    sem_wait(&taskSemaphores[VOWEL_E]);
     printf("Thread E: Processing 'E' characters\n");
-    char *message = popQueue(&queues[1]);
-    char *queueMsgDuplicate = malloc(ENCODED_SIZE * sizeof(char));  // Dynamically allocate memory
-    int index = 0;
 
-    for (int i = 0; message[i] != '\0'; i++) {
-        if (index >= ENCODED_SIZE) {  // If space is not enough, realloc to double the size
-            queueMsgDuplicate = realloc(queueMsgDuplicate, (index + ENCODED_SIZE) * sizeof(char));
+    // Retrieve a message from the 'E' queue
+    char *message = dequeue_message(&vowelQueues[VOWEL_E]);
+    if (!message)
+        return NULL;
+
+    // Allocate dynamic memory for processed output
+    char *processedMessage = malloc(FRAME_SIZE * sizeof(char));
+    int outputIndex = 0;
+
+    // Process each character in the message
+    for (int i = 0; message[i] != '\0'; i++)
+    {
+        // Reallocate memory if the buffer runs out of space
+        if (outputIndex >= FRAME_SIZE)
+        {
+            processedMessage = realloc(processedMessage, (outputIndex + FRAME_SIZE) * sizeof(char));
         }
-        queueMsgDuplicate[index++] = message[i];
-        if (message[i] == 'e' || message[i] == 'E') {
-            vowel_stats[E_IDX]++;
-            char count_str[10];
-            snprintf(count_str, sizeof(count_str), "%d", vowel_stats[E_IDX]);
-            for (int j = 0; count_str[j] != '\0'; j++) {
-                if (index >= ENCODED_SIZE) {
-                    queueMsgDuplicate = realloc(queueMsgDuplicate, (index + ENCODED_SIZE) * sizeof(char));
+
+        // Copy the current character to the processed buffer
+        processedMessage[outputIndex++] = message[i];
+
+        // Update vowel count and append it if 'E' or 'e' is found
+        if (message[i] == 'e' || message[i] == 'E')
+        {
+            vowelCount[VOWEL_E]++;
+            char countStr[10];
+            snprintf(countStr, sizeof(countStr), "%d", vowelCount[VOWEL_E]);
+
+            // Append the updated count to the processed buffer
+            for (int j = 0; countStr[j] != '\0'; j++)
+            {
+                if (outputIndex >= FRAME_SIZE)
+                {
+                    processedMessage = realloc(processedMessage, (outputIndex + FRAME_SIZE) * sizeof(char));
                 }
-                queueMsgDuplicate[index++] = count_str[j];
+                processedMessage[outputIndex++] = countStr[j];
             }
         }
     }
+
+    // Null-terminate the processed message and free original memory
+    processedMessage[outputIndex] = '\0';
     free(message);
-    queueMsgDuplicate[index] = '\0';
-    pushQueue(&queues[2], queueMsgDuplicate);
-    sem_post(&semaphores[2]);
+
+    // Enqueue the processed message into the next queue and signal the next semaphore
+    enqueue_message(&vowelQueues[VOWEL_I], processedMessage);
+    sem_post(&taskSemaphores[VOWEL_I]);
+
+    return NULL;
 }
 
-void *charI(void *arg) {
-    sem_wait(&semaphores[2]);
+// Processes 'I' characters from the corresponding queue
+void *process_char_I(void *arg)
+{
+    // Wait for the semaphore signal
+    sem_wait(&taskSemaphores[VOWEL_I]);
     printf("Thread I: Processing 'I' characters\n");
-    char *message = popQueue(&queues[2]);
-    char *queueMsgDuplicate = malloc(ENCODED_SIZE * sizeof(char));  // Dynamically allocate memory
-    int index = 0;
 
-    for (int i = 0; message[i] != '\0'; i++) {
-        if (index >= ENCODED_SIZE) {  // If space is not enough, realloc to double the size
-            queueMsgDuplicate = realloc(queueMsgDuplicate, (index + ENCODED_SIZE) * sizeof(char));
+    // Retrieve a message from the 'I' queue
+    char *message = dequeue_message(&vowelQueues[VOWEL_I]);
+    if (!message)
+        return NULL;
+
+    // Allocate dynamic memory for processed output
+    char *processedMessage = malloc(FRAME_SIZE * sizeof(char));
+    int outputIndex = 0;
+
+    // Process each character in the message
+    for (int i = 0; message[i] != '\0'; i++)
+    {
+        // Reallocate memory if the buffer runs out of space
+        if (outputIndex >= FRAME_SIZE)
+        {
+            processedMessage = realloc(processedMessage, (outputIndex + FRAME_SIZE) * sizeof(char));
         }
-        queueMsgDuplicate[index++] = message[i];
-        if (message[i] == 'i' || message[i] == 'I') {
-            vowel_stats[I_IDX]++;
-            char count_str[10];
-            snprintf(count_str, sizeof(count_str), "%d", vowel_stats[I_IDX]);
-            for (int j = 0; count_str[j] != '\0'; j++) {
-                if (index >= ENCODED_SIZE) {
-                    queueMsgDuplicate = realloc(queueMsgDuplicate, (index + ENCODED_SIZE) * sizeof(char));
+
+        // Copy the current character to the processed buffer
+        processedMessage[outputIndex++] = message[i];
+
+        // Update vowel count and append it if 'I' or 'i' is found
+        if (message[i] == 'i' || message[i] == 'I')
+        {
+            vowelCount[VOWEL_I]++;
+            char countStr[10];
+            snprintf(countStr, sizeof(countStr), "%d", vowelCount[VOWEL_I]);
+
+            // Append the updated count to the processed buffer
+            for (int j = 0; countStr[j] != '\0'; j++)
+            {
+                if (outputIndex >= FRAME_SIZE)
+                {
+                    processedMessage = realloc(processedMessage, (outputIndex + FRAME_SIZE) * sizeof(char));
                 }
-                queueMsgDuplicate[index++] = count_str[j];
+                processedMessage[outputIndex++] = countStr[j];
             }
         }
     }
+
+    // Null-terminate the processed message and free original memory
+    processedMessage[outputIndex] = '\0';
     free(message);
-    queueMsgDuplicate[index] = '\0';
-    pushQueue(&queues[3], queueMsgDuplicate);
-    sem_post(&semaphores[3]);
+
+    // Enqueue the processed message into the next queue and signal the next semaphore
+    enqueue_message(&vowelQueues[VOWEL_O], processedMessage);
+    sem_post(&taskSemaphores[VOWEL_O]);
+
+    return NULL;
 }
 
-void *charO(void *arg) {
-    sem_wait(&semaphores[3]);
+// Processes 'O' characters from the corresponding queue
+void *process_char_O(void *arg)
+{
+    // Wait for the semaphore signal
+    sem_wait(&taskSemaphores[VOWEL_O]);
     printf("Thread O: Processing 'O' characters\n");
-    char *message = popQueue(&queues[3]);
-    char *queueMsgDuplicate = malloc(ENCODED_SIZE * sizeof(char));  // Dynamically allocate memory
-    int index = 0;
 
-    for (int i = 0; message[i] != '\0'; i++) {
-        if (index >= ENCODED_SIZE) {  // If space is not enough, realloc to double the size
-            queueMsgDuplicate = realloc(queueMsgDuplicate, (index + ENCODED_SIZE) * sizeof(char));
+    // Retrieve a message from the 'O' queue
+    char *message = dequeue_message(&vowelQueues[VOWEL_O]);
+    if (!message)
+        return NULL;
+
+    // Allocate dynamic memory for processed output
+    char *processedMessage = malloc(FRAME_SIZE * sizeof(char));
+    int outputIndex = 0;
+
+    // Process each character in the message
+    for (int i = 0; message[i] != '\0'; i++)
+    {
+        // Reallocate memory if the buffer runs out of space
+        if (outputIndex >= FRAME_SIZE)
+        {
+            processedMessage = realloc(processedMessage, (outputIndex + FRAME_SIZE) * sizeof(char));
         }
-        queueMsgDuplicate[index++] = message[i];
-        if (message[i] == 'o' || message[i] == 'O') {
-            vowel_stats[O_IDX]++;
-            char count_str[10];
-            snprintf(count_str, sizeof(count_str), "%d", vowel_stats[O_IDX]);
-            for (int j = 0; count_str[j] != '\0'; j++) {
-                if (index >= ENCODED_SIZE) {
-                    queueMsgDuplicate = realloc(queueMsgDuplicate, (index + ENCODED_SIZE) * sizeof(char));
+
+        // Copy the current character to the processed buffer
+        processedMessage[outputIndex++] = message[i];
+
+        // Update vowel count and append it if 'O' or 'o' is found
+        if (message[i] == 'o' || message[i] == 'O')
+        {
+            vowelCount[VOWEL_O]++;
+            char countStr[10];
+            snprintf(countStr, sizeof(countStr), "%d", vowelCount[VOWEL_O]);
+
+            // Append the updated count to the processed buffer
+            for (int j = 0; countStr[j] != '\0'; j++)
+            {
+                if (outputIndex >= FRAME_SIZE)
+                {
+                    processedMessage = realloc(processedMessage, (outputIndex + FRAME_SIZE) * sizeof(char));
                 }
-                queueMsgDuplicate[index++] = count_str[j];
+                processedMessage[outputIndex++] = countStr[j];
             }
         }
     }
 
-    queueMsgDuplicate[index] = '\0';
-    pushQueue(&queues[4], queueMsgDuplicate);
+    // Null-terminate the processed message and free original memory
+    processedMessage[outputIndex] = '\0';
     free(message);
-    sem_post(&semaphores[4]);
+
+    // Enqueue the processed message into the next queue and signal the next semaphore
+    enqueue_message(&vowelQueues[VOWEL_U], processedMessage);
+    sem_post(&taskSemaphores[VOWEL_U]);
+
+    return NULL;
 }
 
-void *charU(void *arg) {
-    sem_wait(&semaphores[4]);
+// Processes 'U' characters from the corresponding queue
+void *process_char_U(void *arg)
+{
+    // Wait for the semaphore signal
+    sem_wait(&taskSemaphores[VOWEL_U]);
     printf("Thread U: Processing 'U' characters\n");
-    char *message = popQueue(&queues[4]);
-    char *queueMsgDuplicate = malloc(ENCODED_SIZE * sizeof(char));  // Dynamically allocate memory
-    int index = 0;
 
-    for (int i = 0; message[i] != '\0'; i++) {
-        if (index >= ENCODED_SIZE) {  // If space is not enough, realloc to double the size
-            queueMsgDuplicate = realloc(queueMsgDuplicate, (index + ENCODED_SIZE) * sizeof(char));
+    // Retrieve a message from the 'U' queue
+    char *message = dequeue_message(&vowelQueues[VOWEL_U]);
+    if (!message)
+        return NULL;
+
+    // Allocate dynamic memory for processed output
+    char *processedMessage = malloc(FRAME_SIZE * sizeof(char));
+    int outputIndex = 0;
+
+    // Process each character in the message
+    for (int i = 0; message[i] != '\0'; i++)
+    {
+        // Reallocate memory if the buffer runs out of space
+        if (outputIndex >= FRAME_SIZE)
+        {
+            processedMessage = realloc(processedMessage, (outputIndex + FRAME_SIZE) * sizeof(char));
         }
-        queueMsgDuplicate[index++] = message[i];
-        if (message[i] == 'u' || message[i] == 'U') {
-            vowel_stats[U_IDX]++;
-            char count_str[10];
-            snprintf(count_str, sizeof(count_str), "%d", vowel_stats[U_IDX]);
-            for (int j = 0; count_str[j] != '\0'; j++) {
-                if (index >= ENCODED_SIZE) {
-                    queueMsgDuplicate = realloc(queueMsgDuplicate, (index + ENCODED_SIZE) * sizeof(char));
+
+        // Copy the current character to the processed buffer
+        processedMessage[outputIndex++] = message[i];
+
+        // Update vowel count and append it if 'U' or 'u' is found
+        if (message[i] == 'u' || message[i] == 'U')
+        {
+            vowelCount[VOWEL_U]++;
+            char countStr[10];
+            snprintf(countStr, sizeof(countStr), "%d", vowelCount[VOWEL_U]);
+
+            // Append the updated count to the processed buffer
+            for (int j = 0; countStr[j] != '\0'; j++)
+            {
+                if (outputIndex >= FRAME_SIZE)
+                {
+                    processedMessage = realloc(processedMessage, (outputIndex + FRAME_SIZE) * sizeof(char));
                 }
-                queueMsgDuplicate[index++] = count_str[j];
+                processedMessage[outputIndex++] = countStr[j];
             }
         }
     }
+
+    // Null-terminate the processed message and free original memory
+    processedMessage[outputIndex] = '\0';
     free(message);
-    queueMsgDuplicate[index] = '\0';
-    pushQueue(&queues[5], queueMsgDuplicate);
-    sem_post(&semaphores[5]);
+
+    // Enqueue the processed message into the next queue and signal the next semaphore
+    enqueue_message(&vowelQueues[5], processedMessage);
+    sem_post(&taskSemaphores[5]);
+
+    return NULL;
 }
 
-void decodeUsingHelper(char *enc, char *dec, int len) {
-    int help_sock_fd;
-    struct sockaddr_in helper_addr;
-    if ((help_sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        exit(EXIT_FAILURE);
-    }
+// Sends encoded data to the helper for decoding and retrieves the decoded result
+void request_decoding_from_helper(const char *encodedData, char *decodedData, int dataLength)
+{
+    int helperSocket;
+    struct sockaddr_in helperAddr;
 
-    helper_addr.sin_family = AF_INET;
-    helper_addr.sin_port = htons(14357);
-
-    if (inet_pton(AF_INET, "127.0.0.1", &helper_addr.sin_addr) <= 0) {
-        close(help_sock_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    if (connect(help_sock_fd, (struct sockaddr *)&helper_addr, sizeof(helper_addr)) < 0) {
-        close(help_sock_fd);
-        exit(EXIT_FAILURE);
-    }
-    printf("Connected to helper node");
-    char Ops[] = "D";  
-
-    send(help_sock_fd, Ops, 1, 0);
-    send(help_sock_fd, enc, len, 0);
-    recv(help_sock_fd, dec, CHAR_SIZE, 0);  
-    close(help_sock_fd);
-}
-
-void *finalVowelCount(void *arg) {
-    sem_wait(&semaphores[5]);
-    printf("Thread F: Final Vowel Counts\n");
-    printf("Letter aA: %d\n", vowel_stats[A_IDX]);
-    printf("Letter eE: %d\n", vowel_stats[E_IDX]);
-    printf("Letter iI: %d\n", vowel_stats[I_IDX]);
-    printf("Letter oO: %d\n", vowel_stats[O_IDX]);
-    printf("Letter uU: %d\n", vowel_stats[U_IDX]);
-
-    FILE *file = fopen("vowelCount.txt", "w");
-    fprintf(file, "Totals\n");
-    fprintf(file, "Letter aA: %d\n", vowel_stats[A_IDX]);
-    fprintf(file, "Letter eE: %d\n", vowel_stats[E_IDX]);
-    fprintf(file, "Letter iI: %d\n",vowel_stats[I_IDX]);
-    fprintf(file, "Letter oO: %d\n", vowel_stats[O_IDX]);
-    fprintf(file, "Letter uU: %d\n", vowel_stats[U_IDX]);
-    fclose(file);
-   
-}
-
-void encodeUsingHelper(char *proc, char *enc) {
-    int help_sock_fd;
-    struct sockaddr_in helper_addr;
-    if ((help_sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        exit(EXIT_FAILURE);
-    }
-    helper_addr.sin_family = AF_INET;
-    helper_addr.sin_port = htons(14357);
-
-    if (inet_pton(AF_INET, "127.0.0.1", &helper_addr.sin_addr) <= 0) {
-        close(help_sock_fd);
-        exit(EXIT_FAILURE);
-    }
-    if (connect(help_sock_fd, (struct sockaddr *)&helper_addr, sizeof(helper_addr)) < 0) {
-        close(help_sock_fd);
-        exit(EXIT_FAILURE);
-    }
-    printf("Connected - helper node succesfully");
-    char ops[] = "E";
-
-    send(help_sock_fd, ops, 1, 0);
-    send(help_sock_fd, proc, CHAR_SIZE, 0);
-
-    recv(help_sock_fd, enc, ENCODED_SIZE, 0); 
-    close(help_sock_fd);
-}
-
-
-void *handleClient(void *arg) {
-    int client_socket = *(int *)arg;
-    char buffer[ENCODED_SIZE] = {0};
-    int bytes_received;
-    char encoded_message[BUF_SIZE];
-    char decoded_message[BUF_SIZE];
-    char processed_message[BUF_SIZE];
-    char reencoded_message[BUF_SIZE];
-
-    bytes_received = read(client_socket, encoded_message, BUF_SIZE);
-    printf("Received content from client\n");
-
-    char received_data[bytes_received];
-    received_data[0] = '\0';
-
-    int frames_received = (bytes_received + ENCODED_SIZE - 1) / ENCODED_SIZE;
-    for (int i = 0; i < frames_received; i++) {
-        char temp[CHAR_SIZE];
-        if (i == frames_received - 1) {
-            decodeUsingHelper(&encoded_message[i * ENCODED_SIZE], temp, bytes_received - (i * ENCODED_SIZE));
-        } else {
-            decodeUsingHelper(&encoded_message[i * ENCODED_SIZE], temp, ENCODED_SIZE);
-        }
-        strncat(received_data, temp, strlen(temp));
-    }
-
-    printf(" Decoded Content: %s\n", received_data);
-
-    pushQueue(&queues[0], received_data);
-    sem_post(&semaphores[0]);
-
-    pthread_t threads[6];
-    pthread_create(&threads[0], NULL, charA, NULL);
-    pthread_create(&threads[1], NULL, charE, NULL);
-    pthread_create(&threads[2], NULL, charI, NULL);
-    pthread_create(&threads[3], NULL, charO, NULL);
-    pthread_create(&threads[4], NULL, charU, NULL);
-    pthread_create(&threads[5], NULL, finalVowelCount, NULL);
-
-    for (int i = 0; i < 6; i++) {
-        pthread_join(threads[i], NULL);
-    }
-
-    char *queueContentfinal = popQueue(&queues[5]);
-    FILE *outputFile = fopen("output.txt", "w");
-    fprintf(outputFile, "%s\n", queueContentfinal);
-    fclose(outputFile);
-
-    free(queueContentfinal);
-
-    FILE *fileVowel = fopen("vowelCount.txt", "r");
-    char vowelSummary[BUF_SIZE];
-    fread(vowelSummary, 1, BUF_SIZE, fileVowel);
-    fclose(fileVowel);
-
-    //write(client_socket, vowelSummary, strlen(vowelSummary));
-    int bit_size = 0;
-    int chunk = (strlen(vowelSummary) + CHAR_SIZE - 1) / CHAR_SIZE;
-    char encodedResponseToTf[chunk * ENCODED_SIZE]; 
-    
-    for (int i = 0; i < chunk; i++) {
-        char buffer1[CHAR_SIZE];
-        char encBuffer[ENCODED_SIZE];
-        if (i == chunk - 1) {
-            strncpy(buffer1, vowelSummary + (i * CHAR_SIZE), strlen(vowelSummary) - (i* CHAR_SIZE));
-            buffer1[strlen(vowelSummary) - (i* CHAR_SIZE)] = '\0';
-        } else {
-            strncpy(buffer1, vowelSummary + (i * CHAR_SIZE), CHAR_SIZE);
-        }
-       encodeUsingHelper(buffer1, encBuffer);
-        if (i == chunk - 1) {
-            bit_size += 24 + (strlen(vowelSummary) - (i* CHAR_SIZE)) * 8;
-        } else {
-            bit_size += ENCODED_SIZE;
-        }
-        memcpy(&encodedResponseToTf[i * ENCODED_SIZE], encBuffer, bit_size);
-        if (i == chunk - 1) {
-            encodedResponseToTf[bit_size] = '\0';
-        }
-      
-        
-    } 
-    char responseClient[bit_size + 1];
-    memcpy(responseClient, encodedResponseToTf, bit_size);
-    responseClient[bit_size] = '\0';
-    send(client_socket, responseClient, bit_size + 1, 0);
-
-    close(client_socket);
-    pthread_exit(NULL);
-}
-
-int main() {
-    int server_socket, client_socket;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t addr_size;
-
-    // Initialize semaphore and queues
-    for (int i = 0; i < 6; i++) {
-        sem_init(&semaphores[i], 0, 0);
-    }
-
-    for (int i = 0; i < 5; i++) {
-        initializeQueue(&queues[i]);
-    }
-
-    // Create server socket
-    server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_socket < 0) {
+    // Create a TCP socket
+    if ((helperSocket = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+    {
         perror("Socket creation failed");
         exit(EXIT_FAILURE);
     }
 
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    // Configure the helper server address
+    helperAddr.sin_family = AF_INET;
+    helperAddr.sin_port = htons(14357); // Use previously defined constant
 
-    // Bind socket
-    if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+    // Convert IP address and check validity
+    if (inet_pton(AF_INET, "127.0.0.1", &helperAddr.sin_addr) <= 0)
+    {
+        perror("Invalid IP address");
+        close(helperSocket);
+        exit(EXIT_FAILURE);
+    }
+
+    // Establish a connection to the helper node
+    if (connect(helperSocket, (struct sockaddr *)&helperAddr, sizeof(helperAddr)) < 0)
+    {
+        perror("Connection to helper node failed");
+        close(helperSocket);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Connected to helper node\n");
+
+    // Send decoding request
+    const char operation[] = "D";
+    send(helperSocket, operation, sizeof(operation) - 1, 0);
+
+    // Transmit encoded data
+    send(helperSocket, encodedData, dataLength, 0);
+
+    // Receive the decoded result
+    int receivedBytes = recv(helperSocket, decodedData, SEGMENT_SIZE, 0);
+    if (receivedBytes < 0)
+    {
+        perror("Failed to receive decoded data");
+    }
+    else
+    {
+        decodedData[receivedBytes] = '\0'; // Null-terminate the received data
+    }
+
+    // Close the socket after the operation
+    close(helperSocket);
+}
+
+// Displays and saves the final vowel counts to a file
+void *display_and_save_vowel_counts(void *arg)
+{
+    // Wait for the final semaphore signal
+    sem_wait(&taskSemaphores[5]);
+
+    // Display final counts
+    printf("Thread F: Final Vowel Counts\n");
+    printf("Letter aA: %d\n", vowelCount[VOWEL_A]);
+    printf("Letter eE: %d\n", vowelCount[VOWEL_E]);
+    printf("Letter iI: %d\n", vowelCount[VOWEL_I]);
+    printf("Letter oO: %d\n", vowelCount[VOWEL_O]);
+    printf("Letter uU: %d\n", vowelCount[VOWEL_U]);
+
+    // Save the counts to a file
+    FILE *file = fopen("vowelCount.txt", "w");
+    if (!file)
+    {
+        perror("File creation failed");
+        return NULL;
+    }
+
+    fprintf(file, "Final Vowel Counts:\n");
+    fprintf(file, "Letter aA: %d\n", vowelCount[VOWEL_A]);
+    fprintf(file, "Letter eE: %d\n", vowelCount[VOWEL_E]);
+    fprintf(file, "Letter iI: %d\n", vowelCount[VOWEL_I]);
+    fprintf(file, "Letter oO: %d\n", vowelCount[VOWEL_O]);
+    fprintf(file, "Letter uU: %d\n", vowelCount[VOWEL_U]);
+
+    fclose(file);
+    printf("Vowel counts saved to vowelCount.txt\n");
+
+    return NULL;
+}
+
+// Sends data to the helper for encoding and retrieves the encoded result
+void request_encoding_from_helper(const char *processedData, char *encodedData)
+{
+    int helperSocket;
+    struct sockaddr_in helperAddr;
+
+    // Create a TCP socket
+    if ((helperSocket = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+    {
+        perror("Socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Configure the helper server address
+    helperAddr.sin_family = AF_INET;
+    helperAddr.sin_port = htons(14357);
+
+    // Convert IP address and validate
+    if (inet_pton(AF_INET, "127.0.0.1", &helperAddr.sin_addr) <= 0)
+    {
+        perror("Invalid IP address");
+        close(helperSocket);
+        exit(EXIT_FAILURE);
+    }
+
+    // Establish a connection to the helper node
+    if (connect(helperSocket, (struct sockaddr *)&helperAddr, sizeof(helperAddr)) < 0)
+    {
+        perror("Connection to helper node failed");
+        close(helperSocket);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Connected to helper node\n");
+
+    // Send encoding request
+    const char operation[] = "E";
+    send(helperSocket, operation, sizeof(operation) - 1, 0);
+
+    // Transmit data to encode
+    send(helperSocket, processedData, SEGMENT_SIZE, 0);
+
+    // Receive the encoded result
+    int receivedBytes = recv(helperSocket, encodedData, FRAME_SIZE, 0);
+    if (receivedBytes < 0)
+    {
+        perror("Failed to receive encoded data");
+    }
+    else
+    {
+        encodedData[receivedBytes] = '\0'; // Null-terminate the received data
+    }
+
+    // Close the socket after the operation
+    close(helperSocket);
+}
+
+// Handles incoming client requests, processes the data, and sends back results
+void *process_client_request(void *arg)
+{
+    int clientSocket = *(int *)arg;
+    char encodedMessage[BUFFER_CAPACITY] = {0};
+    char receivedData[BUFFER_CAPACITY] = {0};
+    int bytesReceived;
+
+    // Receive content from the client
+    bytesReceived = read(clientSocket, encodedMessage, BUFFER_CAPACITY);
+    if (bytesReceived <= 0)
+    {
+        perror("Failed to read client data");
+        close(clientSocket);
+        pthread_exit(NULL);
+    }
+    printf("Received content from client\n");
+
+    // Decode the received frames
+    int framesReceived = (bytesReceived + FRAME_SIZE - 1) / FRAME_SIZE;
+    for (int i = 0; i < framesReceived; i++)
+    {
+        char tempBuffer[SEGMENT_SIZE];
+        int frameLength = (i == framesReceived - 1)
+                              ? bytesReceived - (i * FRAME_SIZE)
+                              : FRAME_SIZE;
+
+        request_decoding_from_helper(&encodedMessage[i * FRAME_SIZE], tempBuffer, frameLength);
+        strncat(receivedData, tempBuffer, strlen(tempBuffer));
+    }
+
+    printf("Decoded Content: %s\n", receivedData);
+
+    // Begin vowel counting using parallel threads
+    enqueue_message(&vowelQueues[VOWEL_A], receivedData);
+    sem_post(&taskSemaphores[VOWEL_A]);
+
+    pthread_t vowelThreads[6];
+    pthread_create(&vowelThreads[0], NULL, process_char_A, NULL);
+    pthread_create(&vowelThreads[1], NULL, process_char_E, NULL);
+    pthread_create(&vowelThreads[2], NULL, process_char_I, NULL);
+    pthread_create(&vowelThreads[3], NULL, process_char_O, NULL);
+    pthread_create(&vowelThreads[4], NULL, process_char_U, NULL);
+    pthread_create(&vowelThreads[5], NULL, display_and_save_vowel_counts, NULL);
+
+    for (int i = 0; i < 6; i++)
+    {
+        pthread_join(vowelThreads[i], NULL);
+    }
+
+    // Save final content to the output file
+    char *finalQueueContent = dequeue_message(&vowelQueues[5]);
+    FILE *outputFile = fopen("output.txt", "w");
+    fprintf(outputFile, "%s\n", finalQueueContent);
+    fclose(outputFile);
+    free(finalQueueContent);
+
+    // Read vowel count summary
+    FILE *fileVowel = fopen("vowelCount.txt", "r");
+    char vowelSummary[BUFFER_CAPACITY] = {0};
+    fread(vowelSummary, 1, BUFFER_CAPACITY, fileVowel);
+    fclose(fileVowel);
+
+    // Encode and prepare the response
+    int summaryLength = strlen(vowelSummary);
+    int totalChunks = (summaryLength + SEGMENT_SIZE - 1) / SEGMENT_SIZE;
+    char encodedResponse[totalChunks * FRAME_SIZE];
+
+    int bitSize = 0;
+    for (int i = 0; i < totalChunks; i++)
+    {
+        char tempSegment[SEGMENT_SIZE] = {0};
+        char encodedSegment[FRAME_SIZE] = {0};
+        int segmentSize = (i == totalChunks - 1)
+                              ? summaryLength - (i * SEGMENT_SIZE)
+                              : SEGMENT_SIZE;
+
+        strncpy(tempSegment, vowelSummary + (i * SEGMENT_SIZE), segmentSize);
+        request_encoding_from_helper(tempSegment, encodedSegment);
+
+        int frameBitSize = (i == totalChunks - 1)
+                               ? 24 + segmentSize * 8
+                               : FRAME_SIZE;
+
+        memcpy(&encodedResponse[i * FRAME_SIZE], encodedSegment, frameBitSize);
+        bitSize += frameBitSize;
+    }
+
+    // Send encoded response to the client
+    send(clientSocket, encodedResponse, bitSize, 0);
+
+    close(clientSocket);
+    pthread_exit(NULL);
+}
+
+int main()
+{
+    int serverSocket, clientSocket;
+    struct sockaddr_in serverAddr, clientAddr;
+    socklen_t addrSize;
+
+    // Initialize semaphores and queues
+    for (int i = 0; i < 6; i++)
+    {
+        sem_init(&taskSemaphores[i], 0, 0);
+    }
+
+    for (int i = 0; i < 5; i++)
+    {
+        initialize_message_queue(&vowelQueues[i]);
+    }
+
+    // Create the server socket
+    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket < 0)
+    {
+        perror("Socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Configure the server address
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(SERVER_PORT);
+
+    // Bind the socket
+    if (bind(serverSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0)
+    {
         perror("Bind failed");
-        close(server_socket);
+        close(serverSocket);
         exit(EXIT_FAILURE);
     }
 
-    // Listen for incoming connections
-    if (listen(server_socket, 10) < 0) {
-        perror("Listen failed");
-        close(server_socket);
+    // Start listening for incoming connections
+    if (listen(serverSocket, 10) < 0)
+    {
+        perror("Listening failed");
+        close(serverSocket);
         exit(EXIT_FAILURE);
     }
 
-    printf("Server is listening on port %d...\n", PORT);
+    printf("Server is listening on port %d...\n", SERVER_PORT);
 
-    while (1) {
-        addr_size = sizeof(client_addr);
-        client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &addr_size);
-        if (client_socket < 0) {
-            perror("Accept failed");
+    // Main server loop for accepting and processing client requests
+    while (1)
+    {
+        addrSize = sizeof(clientAddr);
+        clientSocket = accept(serverSocket, (struct sockaddr *)&clientAddr, &addrSize);
+        if (clientSocket < 0)
+        {
+            perror("Client connection failed");
             continue;
         }
 
         printf("Client connected\n");
 
-        pthread_t client_thread;
-        pthread_create(&client_thread, NULL, handleClient, &client_socket);
+        // Create a new thread to handle the connected client
+        pthread_t clientThread;
+        if (pthread_create(&clientThread, NULL, process_client_request, &clientSocket) != 0)
+        {
+            perror("Failed to create client thread");
+            close(clientSocket);
+        }
+        else
+        {
+            pthread_detach(clientThread); // Automatically manage thread resources
+        }
     }
 
-    close(server_socket);
-    for (int i = 0; i < 6; i++) {
-        sem_destroy(&semaphores[i]);
+    // Close the server socket and clean up resources
+    close(serverSocket);
+
+    // Destroy semaphores and queue locks
+    for (int i = 0; i < 6; i++)
+    {
+        sem_destroy(&taskSemaphores[i]);
     }
-    for (int i = 0; i < 5; i++) {
-        pthread_mutex_destroy(&queues[i].lock);
-        pthread_cond_destroy(&queues[i].not_empty);
-        pthread_cond_destroy(&queues[i].not_full);
+
+    for (int i = 0; i < 5; i++)
+    {
+        pthread_mutex_destroy(&vowelQueues[i].queueLock);
+        pthread_cond_destroy(&vowelQueues[i].notEmpty);
+        pthread_cond_destroy(&vowelQueues[i].notFull);
     }
 
     return 0;
 }
-
